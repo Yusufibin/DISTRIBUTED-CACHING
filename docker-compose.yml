@@ -1,0 +1,76 @@
+version: "3.8"
+
+services:
+  node1:
+    build: .
+    command: >
+      --node-id node-1
+      --host 0.0.0.0
+      --http-port 8080
+      --node-port 9090
+      --peers "node2:8081,node3:8082"
+      --data-dir /data
+      --replication-factor 2
+      --virtual-nodes 256
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    volumes:
+      - node1_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+  node2:
+    build: .
+    command: >
+      --node-id node-2
+      --host 0.0.0.0
+      --http-port 8081
+      --node-port 9091
+      --peers "node1:8080,node3:8082"
+      --data-dir /data
+      --replication-factor 2
+      --virtual-nodes 256
+    ports:
+      - "8081:8081"
+      - "9091:9091"
+    volumes:
+      - node2_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+  node3:
+    build: .
+    command: >
+      --node-id node-3
+      --host 0.0.0.0
+      --http-port 8082
+      --node-port 9092
+      --peers "node1:8080,node2:8081"
+      --data-dir /data
+      --replication-factor 2
+      --virtual-nodes 256
+    ports:
+      - "8082:8082"
+      - "9092:9092"
+    volumes:
+      - node3_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8082/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  node1_data:
+  node2_data:
+  node3_data:
