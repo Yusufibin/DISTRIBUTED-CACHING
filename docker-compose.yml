@@ -1,11 +1,9 @@
-version: "3.8"
-
 services:
   node1:
     build: .
     command: >
       --node-id node-1
-      --host 0.0.0.0
+      --host node1
       --http-port 8080
       --node-port 9090
       --peers "node2:8081,node3:8082"
@@ -28,7 +26,7 @@ services:
     build: .
     command: >
       --node-id node-2
-      --host 0.0.0.0
+      --host node2
       --http-port 8081
       --node-port 9091
       --peers "node1:8080,node3:8082"
@@ -51,7 +49,7 @@ services:
     build: .
     command: >
       --node-id node-3
-      --host 0.0.0.0
+      --host node3
       --http-port 8082
       --node-port 9092
       --peers "node1:8080,node2:8081"

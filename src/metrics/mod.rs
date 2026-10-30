@@ -24,17 +24,15 @@ static CACHE_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
     .unwrap()
 });
 
-static CACHE_ENTRIES: Lazy<Gauge> = Lazy::new(|| {
-    register_gauge!("cache_entries_total", "Total entries in cache").unwrap()
-});
+static CACHE_ENTRIES: Lazy<Gauge> =
+    Lazy::new(|| register_gauge!("cache_entries_total", "Total entries in cache").unwrap());
 
 static CACHE_EVICTIONS: Lazy<CounterVec> = Lazy::new(|| {
     register_counter_vec!("cache_evictions_total", "Total evictions", &["reason"]).unwrap()
 });
 
-static CLUSTER_NODES: Lazy<Gauge> = Lazy::new(|| {
-    register_gauge!("cluster_nodes_total", "Number of known cluster nodes").unwrap()
-});
+static CLUSTER_NODES: Lazy<Gauge> =
+    Lazy::new(|| register_gauge!("cluster_nodes_total", "Number of known cluster nodes").unwrap());
 
 static REPLICATION_OPS: Lazy<CounterVec> = Lazy::new(|| {
     register_counter_vec!(

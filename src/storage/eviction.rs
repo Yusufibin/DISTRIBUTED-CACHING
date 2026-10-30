@@ -19,7 +19,10 @@ pub fn start_eviction_loop(engine: Arc<StorageEngine>) -> JoinHandle<()> {
             if current > max {
                 let excess = current - max;
                 let evicted = engine.evict_lru(excess + (max / 10));
-                tracing::info!("LRU eviction: removed {} entries (capacity enforcement)", evicted);
+                tracing::info!(
+                    "LRU eviction: removed {} entries (capacity enforcement)",
+                    evicted
+                );
             }
         }
     })

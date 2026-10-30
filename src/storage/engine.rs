@@ -7,7 +7,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,7 +25,7 @@ impl CacheValue {
             .as_secs();
         CacheValue {
             data,
-            expires_at_unix: ttl.map(|t| now + t.as_secs()),
+            expires_at_unix: ttl.map(|t| now.saturating_add(t.as_secs())),
             created_at_unix: now,
         }
     }
@@ -42,11 +42,13 @@ impl CacheValue {
         }
     }
 
-#[allow(dead_code)]
+    #[allow(dead_code)]
     pub fn to_bytes(&self) -> Bytes {
         Bytes::from(self.data.clone())
     }
 }
+
+static ACCESS_CLOCK: AtomicU64 = AtomicU64::new(0);
 
 struct Entry {
     value: CacheValue,
@@ -56,7 +58,7 @@ struct Entry {
 
 impl Entry {
     fn new(value: CacheValue) -> Self {
-        let now = Instant::now().elapsed().as_millis() as u64;
+        let now = ACCESS_CLOCK.fetch_add(1, Ordering::Relaxed);
         Entry {
             value,
             access_count: AtomicU64::new(0),
@@ -67,7 +69,7 @@ impl Entry {
     fn touch(&self) {
         self.access_count.fetch_add(1, Ordering::Relaxed);
         self.last_access.store(
-            Instant::now().elapsed().as_millis() as u64,
+            ACCESS_CLOCK.fetch_add(1, Ordering::Relaxed),
             Ordering::Relaxed,
         );
     }
@@ -77,7 +79,7 @@ pub struct StorageEngine {
     store: Arc<DashMap<String, Arc<Entry>>>,
     config: Config,
     metrics: Arc<Metrics>,
-    entry_count: AtomicU64,
+    mutations: parking_lot::Mutex<()>,
 }
 
 impl StorageEngine {
@@ -86,17 +88,24 @@ impl StorageEngine {
             store: Arc::new(DashMap::with_capacity(1024)),
             config,
             metrics,
-            entry_count: AtomicU64::new(0),
+            mutations: parking_lot::Mutex::new(()),
         }
     }
 
     pub fn get(&self, key: &str) -> Option<CacheValue> {
+        // Remove only the expired version we observed, never a concurrent replacement.
         let entry = self.store.get(key)?;
         if entry.value.is_expired() {
             drop(entry);
-            self.store.remove(key);
-            self.entry_count.fetch_sub(1, Ordering::Relaxed);
-            self.metrics.record_eviction("expired");
+            let _guard = self.mutations.lock();
+            if self
+                .store
+                .remove_if(key, |_, entry| entry.value.is_expired())
+                .is_some()
+            {
+                self.metrics.record_eviction("expired");
+                self.metrics.set_entries(self.len() as f64);
+            }
             return None;
         }
         entry.touch();
@@ -104,22 +113,16 @@ impl StorageEngine {
     }
 
     pub fn set(&self, key: String, value: CacheValue) {
-        let is_new = !self.store.contains_key(&key);
+        let _guard = self.mutations.lock();
         self.store.insert(key, Arc::new(Entry::new(value)));
-        if is_new {
-            let count = self.entry_count.fetch_add(1, Ordering::Relaxed) + 1;
-            self.metrics.set_entries(count as f64);
-        }
+        self.metrics.set_entries(self.len() as f64);
     }
 
     pub fn delete(&self, key: &str) -> bool {
-        if self.store.remove(key).is_some() {
-            let count = self.entry_count.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
-            self.metrics.set_entries(count as f64);
-            true
-        } else {
-            false
-        }
+        let _guard = self.mutations.lock();
+        let removed = self.store.remove(key).is_some();
+        self.metrics.set_entries(self.len() as f64);
+        removed
     }
 
     #[allow(dead_code)]
@@ -128,10 +131,11 @@ impl StorageEngine {
     }
 
     pub fn len(&self) -> u64 {
-        self.entry_count.load(Ordering::Relaxed)
+        self.store.len() as u64
     }
 
     pub fn evict_expired(&self) -> u64 {
+        let _guard = self.mutations.lock();
         let mut evicted = 0u64;
         let expired_keys: Vec<String> = self
             .store
@@ -141,25 +145,34 @@ impl StorageEngine {
             .collect();
 
         for key in expired_keys {
-            if self.store.remove(&key).is_some() {
+            if self
+                .store
+                .remove_if(&key, |_, entry| entry.value.is_expired())
+                .is_some()
+            {
                 evicted += 1;
                 self.metrics.record_eviction("expired");
             }
         }
 
         if evicted > 0 {
-            let count = self.entry_count.fetch_sub(evicted, Ordering::Relaxed).saturating_sub(evicted);
-            self.metrics.set_entries(count as f64);
+            self.metrics.set_entries(self.len() as f64);
         }
 
         evicted
     }
 
     pub fn evict_lru(&self, target: u64) -> u64 {
+        let _guard = self.mutations.lock();
         let mut entries: Vec<(String, u64)> = self
             .store
             .iter()
-            .map(|e| (e.key().clone(), e.value().last_access.load(Ordering::Relaxed)))
+            .map(|e| {
+                (
+                    e.key().clone(),
+                    e.value().last_access.load(Ordering::Relaxed),
+                )
+            })
             .collect();
 
         entries.sort_by_key(|(_, ts)| *ts);
@@ -174,8 +187,7 @@ impl StorageEngine {
         }
 
         if evicted > 0 {
-            let count = self.entry_count.fetch_sub(evicted, Ordering::Relaxed).saturating_sub(evicted);
-            self.metrics.set_entries(count as f64);
+            self.metrics.set_entries(self.len() as f64);
         }
 
         evicted
@@ -183,10 +195,16 @@ impl StorageEngine {
 
     #[allow(dead_code)]
     pub fn evict_lfu(&self, target: u64) -> u64 {
+        let _guard = self.mutations.lock();
         let mut entries: Vec<(String, u64)> = self
             .store
             .iter()
-            .map(|e| (e.key().clone(), e.value().access_count.load(Ordering::Relaxed)))
+            .map(|e| {
+                (
+                    e.key().clone(),
+                    e.value().access_count.load(Ordering::Relaxed),
+                )
+            })
             .collect();
 
         entries.sort_by_key(|(_, count)| *count);
@@ -201,8 +219,7 @@ impl StorageEngine {
         }
 
         if evicted > 0 {
-            let count = self.entry_count.fetch_sub(evicted, Ordering::Relaxed).saturating_sub(evicted);
-            self.metrics.set_entries(count as f64);
+            self.metrics.set_entries(self.len() as f64);
         }
 
         evicted
@@ -219,11 +236,10 @@ impl StorageEngine {
     pub fn restore_entries(&self, entries: Vec<(String, CacheValue)>) {
         for (key, value) in entries {
             if !value.is_expired() {
-                self.store.insert(key, Arc::new(Entry::new(value)));
-                self.entry_count.fetch_add(1, Ordering::Relaxed);
+                self.set(key, value);
             }
         }
-        self.metrics.set_entries(self.entry_count.load(Ordering::Relaxed) as f64);
+        self.metrics.set_entries(self.len() as f64);
     }
 
     pub fn max_entries(&self) -> u64 {

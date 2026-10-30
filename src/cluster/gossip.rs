@@ -18,6 +18,7 @@ pub fn start_gossip(state: Arc<ClusterState>, config: Config) -> JoinHandle<()> 
         let mut interval = time::interval(Duration::from_secs(config.gossip_interval_secs));
         loop {
             interval.tick().await;
+            state.update_last_seen(&config.node_id);
             let peers: Vec<String> = state
                 .all_nodes()
                 .into_iter()
@@ -32,7 +33,10 @@ pub fn start_gossip(state: Arc<ClusterState>, config: Config) -> JoinHandle<()> 
             let sample_size = (peers.len() / 2).max(1);
             let targets: Vec<String> = {
                 let mut rng = rand::thread_rng();
-                peers.choose_multiple(&mut rng, sample_size).cloned().collect()
+                peers
+                    .choose_multiple(&mut rng, sample_size)
+                    .cloned()
+                    .collect()
             };
 
             let msg = GossipMessage {

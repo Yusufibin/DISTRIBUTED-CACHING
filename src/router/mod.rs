@@ -21,7 +21,7 @@ pub struct SmartRouter {
 impl SmartRouter {
     pub fn new(config: Config, cluster: Arc<ClusterState>) -> Self {
         let mut ring = ConsistentHashRing::new(config.virtual_nodes);
-        ring.add_node(&config.node_id);
+        ring.add_node(&peer_to_node_id(&config.node_addr()));
         for peer in &config.peers {
             let node_id = peer_to_node_id(peer);
             ring.add_node(&node_id);
@@ -49,15 +49,20 @@ impl SmartRouter {
 
     pub fn is_local(&self, key: &str) -> bool {
         self.primary_node(key)
-            .map(|n| n == self.config.node_id)
+            .map(|n| n == peer_to_node_id(&self.config.node_addr()))
             .unwrap_or(false)
     }
 
     pub fn node_address(&self, node_id: &str) -> Option<String> {
-        if node_id == self.config.node_id {
+        if node_id == peer_to_node_id(&self.config.node_addr()) {
             return Some(self.config.node_addr());
         }
-        self.cluster.node_address(node_id)
+        self.config
+            .peers
+            .iter()
+            .find(|addr| peer_to_node_id(addr) == node_id)
+            .cloned()
+            .or_else(|| self.cluster.node_address(node_id))
     }
 
     pub fn circuit_breaker_for(&self, node_id: &str) -> Arc<CircuitBreaker> {
@@ -114,5 +119,5 @@ impl SmartRouter {
 }
 
 pub fn peer_to_node_id(peer_addr: &str) -> String {
-    format!("node-{}", peer_addr.replace([':', '.'], "-"))
+    format!("node@{}", peer_addr)
 }

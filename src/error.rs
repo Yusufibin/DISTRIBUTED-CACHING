@@ -30,5 +30,3 @@ impl From<bincode::Error> for CacheError {
         CacheError::Serialization(e.to_string())
     }
 }
-
-

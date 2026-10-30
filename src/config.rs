@@ -62,3 +62,39 @@ impl Config {
         format!("{}:{}", self.host, self.node_port)
     }
 }
+
+impl Config {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.http_port != self.node_port,
+            "HTTP and internal ports must differ"
+        );
+        anyhow::ensure!(
+            self.max_entries > 0 && self.virtual_nodes > 0 && self.replication_factor > 0,
+            "capacity, virtual nodes and replication factor must be positive"
+        );
+        anyhow::ensure!(
+            self.gossip_interval_secs > 0
+                && self.heartbeat_interval_secs > 0
+                && self.snapshot_interval_secs > 0
+                && self.request_timeout_secs > 0
+                && self.circuit_breaker_threshold > 0
+                && self.circuit_breaker_timeout_secs > 0,
+            "intervals, timeouts and circuit breaker threshold must be positive"
+        );
+        anyhow::ensure!(
+            !self.host.is_empty() && self.host != "0.0.0.0" && self.host != "::",
+            "--host must be an advertised hostname or address reachable by peers"
+        );
+        for peer in &self.peers {
+            let (host, port) = peer
+                .rsplit_once(':')
+                .ok_or_else(|| anyhow::anyhow!("invalid peer: {peer}"))?;
+            anyhow::ensure!(
+                !host.is_empty() && port.parse::<u16>().is_ok_and(|port| port > 0),
+                "invalid peer: {peer}"
+            );
+        }
+        Ok(())
+    }
+}

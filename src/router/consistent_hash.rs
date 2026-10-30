@@ -53,7 +53,7 @@ impl ConsistentHashRing {
     }
 
     pub fn get_nodes(&self, key: &str, count: usize) -> Vec<String> {
-        if self.ring.is_empty() {
+        if count == 0 || self.ring.is_empty() {
             return vec![];
         }
         let hash = Self::hash(key);

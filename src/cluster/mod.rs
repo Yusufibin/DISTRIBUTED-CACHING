@@ -40,7 +40,7 @@ impl ClusterState {
         let state = ClusterState {
             nodes: DashMap::new(),
             local_id: config.node_id.clone(),
-            stale_threshold: Duration::from_secs(config.heartbeat_interval_secs * 3),
+            stale_threshold: Duration::from_secs(config.heartbeat_interval_secs.saturating_mul(3)),
         };
 
         let local = NodeInfo {
@@ -109,10 +109,24 @@ impl ClusterState {
             if remote.id == self.local_id {
                 continue;
             }
+            let placeholder = crate::router::peer_to_node_id(&remote.addr);
+            if placeholder == remote.id
+                && self
+                    .nodes
+                    .iter()
+                    .any(|node| node.addr == remote.addr && node.id != placeholder)
+            {
+                continue;
+            }
+            if placeholder != remote.id {
+                self.nodes.remove(&placeholder);
+            }
             self.nodes
                 .entry(remote.id.clone())
                 .and_modify(|local| {
                     if remote.last_seen > local.last_seen {
+                        local.addr = remote.addr.clone();
+                        local.node_port = remote.node_port;
                         local.status = remote.status.clone();
                         local.last_seen = remote.last_seen;
                     }
@@ -125,7 +139,7 @@ impl ClusterState {
             if node.id == self.local_id {
                 continue;
             }
-            if node.last_seen > 0 && now - node.last_seen > stale_secs {
+            if node.last_seen > 0 && now.saturating_sub(node.last_seen) > stale_secs {
                 node.status = NodeStatus::Unhealthy;
             }
         }

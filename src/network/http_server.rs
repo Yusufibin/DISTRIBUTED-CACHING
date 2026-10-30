@@ -3,11 +3,11 @@ use crate::{
     storage::engine::CacheValue,
 };
 use axum::{
-    body::Body,
-    extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    body::{Body, Bytes},
+    extract::{DefaultBodyLimit, Path, Query, State},
+    http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{delete, get, put},
+    routing::get,
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -46,9 +46,14 @@ pub struct ClusterInfo {
 pub fn start(state: AppState, port: u16) -> JoinHandle<()> {
     tokio::spawn(async move {
         let router = Router::new()
-            .route("/v1/cache/:key", get(get_handler))
-            .route("/v1/cache/:key", put(set_handler))
-            .route("/v1/cache/:key", delete(delete_handler))
+            .merge(super::node_server::routes())
+            .route(
+                "/v1/cache/:key",
+                get(get_handler)
+                    .put(set_handler)
+                    .delete(delete_handler)
+                    .layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+            )
             .route("/v1/cluster/nodes", get(cluster_nodes_handler))
             .route("/metrics", get(metrics_handler))
             .route("/health", get(health_handler))
@@ -63,10 +68,7 @@ pub fn start(state: AppState, port: u16) -> JoinHandle<()> {
     })
 }
 
-async fn get_handler(
-    State(state): State<AppState>,
-    Path(key): Path<String>,
-) -> Response {
+async fn get_handler(State(state): State<AppState>, Path(key): Path<String>) -> Response {
     let start = std::time::Instant::now();
 
     let result = if state.router.is_local(&key) {
@@ -106,43 +108,48 @@ async fn set_handler(
     State(state): State<AppState>,
     Path(key): Path<String>,
     Query(query): Query<SetQuery>,
-    _headers: HeaderMap,
-    body: Body,
+    bytes: Bytes,
 ) -> Response {
     let start = std::time::Instant::now();
 
-    let bytes = match axum::body::to_bytes(body, 16 * 1024 * 1024).await {
-        Ok(b) => b,
-        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
-    };
+    let ttl = query.ttl.or(Some(state.config.default_ttl_secs));
 
-    let ttl = query.ttl.or_else(|| Some(state.config.default_ttl_secs));
-
+    let value = CacheValue::new(bytes.to_vec(), ttl.map(Duration::from_secs));
     if state.router.is_local(&key) {
-        let value = CacheValue::new(bytes.to_vec(), ttl.map(Duration::from_secs));
-        let _ = state.wal.log_set(&key, &bytes, ttl);
-        state.storage.set(key.clone(), value.clone());
+        if let Err(error) = state.set(key.clone(), value.clone()).await {
+            tracing::error!(%error, "Persistent write failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
         state.metrics.record_request("set", "ok");
-        state.metrics.observe_duration("set", start.elapsed().as_secs_f64());
+        state
+            .metrics
+            .observe_duration("set", start.elapsed().as_secs_f64());
 
-        replicate_to_peers(&state, &key, bytes.to_vec(), ttl).await;
+        replicate_to_peers(&state, &key, value).await;
         StatusCode::OK.into_response()
     } else {
-        forward_set(&state, &key, bytes.to_vec(), ttl).await
+        forward_set(&state, &key, value).await
     }
 }
 
-async fn delete_handler(
-    State(state): State<AppState>,
-    Path(key): Path<String>,
-) -> Response {
+async fn delete_handler(State(state): State<AppState>, Path(key): Path<String>) -> Response {
     let start = std::time::Instant::now();
 
     if state.router.is_local(&key) {
-        let _ = state.wal.log_delete(&key);
-        let deleted = state.storage.delete(&key);
-        state.metrics.record_request("delete", if deleted { "ok" } else { "miss" });
-        state.metrics.observe_duration("delete", start.elapsed().as_secs_f64());
+        let deleted = match state.delete(key.clone()).await {
+            Ok(deleted) => deleted,
+            Err(error) => {
+                tracing::error!(%error, "Persistent delete failed");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+        replicate_delete(&state, &key).await;
+        state
+            .metrics
+            .record_request("delete", if deleted { "ok" } else { "miss" });
+        state
+            .metrics
+            .observe_duration("delete", start.elapsed().as_secs_f64());
         Json(DeleteResult { key, deleted }).into_response()
     } else {
         forward_delete(&state, &key).await
@@ -208,12 +215,7 @@ async fn forward_get(state: &AppState, key: &str) -> Result<CacheValue, StatusCo
     }
 }
 
-async fn forward_set(
-    state: &AppState,
-    key: &str,
-    value: Vec<u8>,
-    ttl: Option<u64>,
-) -> Response {
+async fn forward_set(state: &AppState, key: &str, value: CacheValue) -> Response {
     let node = match state.router.best_available_node(key) {
         Ok(n) => n,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -225,7 +227,7 @@ async fn forward_set(
     };
 
     let client = NodeClient::new(state.config.request_timeout_secs);
-    match client.set(&addr, key, value, ttl).await {
+    match client.set(&addr, key, value).await {
         Ok(_) => {
             state.router.record_success(&node);
             StatusCode::OK.into_response()
@@ -265,11 +267,14 @@ async fn forward_delete(state: &AppState, key: &str) -> Response {
     }
 }
 
-async fn replicate_to_peers(state: &AppState, key: &str, value: Vec<u8>, ttl: Option<u64>) {
+pub(super) async fn replicate_to_peers(state: &AppState, key: &str, value: CacheValue) {
     let replicas = state.router.replica_nodes(key);
     let client = NodeClient::new(state.config.request_timeout_secs);
 
-    for replica_id in replicas.iter().filter(|id| *id != &state.config.node_id) {
+    for replica_id in replicas
+        .iter()
+        .filter(|id| *id != &crate::router::peer_to_node_id(&state.config.node_addr()))
+    {
         if let Some(addr) = state.router.node_address(replica_id) {
             let key = key.to_string();
             let value = value.clone();
@@ -279,7 +284,7 @@ async fn replicate_to_peers(state: &AppState, key: &str, value: Vec<u8>, ttl: Op
             let replica_id = replica_id.clone();
 
             tokio::spawn(async move {
-                match client.set(&addr, &key, value, ttl).await {
+                match client.set(&addr, &key, value).await {
                     Ok(_) => {
                         router.record_success(&replica_id);
                         metrics.record_replication("ok");
@@ -295,4 +300,19 @@ async fn replicate_to_peers(state: &AppState, key: &str, value: Vec<u8>, ttl: Op
     }
 }
 
-
+pub(super) async fn replicate_delete(state: &AppState, key: &str) {
+    for replica in state.router.replica_nodes(key) {
+        if replica == crate::router::peer_to_node_id(&state.config.node_addr()) {
+            continue;
+        }
+        if let Some(addr) = state.router.node_address(&replica) {
+            let client = NodeClient::new(state.config.request_timeout_secs);
+            let key = key.to_string();
+            tokio::spawn(async move {
+                if let Err(error) = client.delete(&addr, &key).await {
+                    tracing::warn!(%error, "Replica delete failed");
+                }
+            });
+        }
+    }
+}

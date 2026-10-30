@@ -1,93 +1,69 @@
 # distributed-cache
 
-Système de cache distribué haute performance en Rust.  
-Réduction de latence de 80% sur architectures microservices à grande échelle.
+Cache distribué en Rust avec API HTTP, routage par consistent hashing,
+réplication asynchrone, expiration TTL et persistance locale WAL + snapshot.
 
-## Architecture
+## Démarrer
 
-```
-                  ┌──────────────────────────────────────┐
-                  │         Microservices clients         │
-                  │       gRPC / REST / async SDK         │
-                  └─────────────────┬────────────────────┘
-                                    │
-                  ┌─────────────────▼────────────────────┐
-                  │             Smart Router              │
-                  │  Consistent hashing · Circuit breaker │
-                  └──────┬──────────┬────────────┬───────┘
-                         │          │            │
-              ┌──────────▼─┐  ┌────▼──────┐  ┌─▼──────────┐
-              │   Node A   │  │  Node B   │  │   Node C   │
-              │  DashMap   │◄─┤  DashMap  ├─►│  DashMap   │
-              │  + Moka    │  │  + Moka   │  │  + Moka    │
-              └──────┬─────┘  └────┬──────┘  └─────┬──────┘
-                     └─────────────┼────────────────┘
-                                   │
-              ┌────────────────────▼─────────────────────┐
-              │            Storage Engine                 │
-              │  Lock-free · zero-copy · tokio runtime    │
-              └─────────────┬──────────────┬─────────────┘
-                            │              │
-              ┌─────────────▼──┐  ┌────────▼────────────┐
-              │  Persistence   │  │    Observabilité     │
-              │  WAL + snapshot│  │  OpenTelemetry+Prom  │
-              └────────────────┘  └─────────────────────┘
-```
-
-## Démarrage rapide
-
-### Compiler
+Prérequis : Rust 1.85 ou supérieur. Python 3 permet d'exécuter le test de cluster.
 
 ```bash
-cargo build --release
+cargo build --release --locked
+./target/release/cache-node --node-id node-1 --data-dir ./data/node1
 ```
 
-### Lancer un cluster local à 3 nœuds
+Le serveur écoute sur toutes les interfaces. `--host` désigne l'adresse **annoncée
+aux pairs**, par défaut `127.0.0.1`. Dans Docker, utiliser le nom du service.
+Les adresses annoncées et celles de `--peers` doivent être identiques sur tous
+les nœuds : elles définissent les propriétaires des clés dans le ring.
+
+### Cluster local à trois nœuds
+
+Exécuter chaque commande dans un terminal distinct :
 
 ```bash
-# Nœud 1
-./target/release/cache-node \
-  --node-id node-1 \
-  --http-port 8080 \
-  --node-port 9090 \
-  --peers "127.0.0.1:8081,127.0.0.1:8082" \
-  --data-dir ./data/node1 &
+./target/release/cache-node --node-id node-1 --http-port 8080 --node-port 9090 \
+  --peers 127.0.0.1:8081,127.0.0.1:8082 --data-dir ./data/node1
 
-# Nœud 2
-./target/release/cache-node \
-  --node-id node-2 \
-  --http-port 8081 \
-  --node-port 9091 \
-  --peers "127.0.0.1:8080,127.0.0.1:8082" \
-  --data-dir ./data/node2 &
+./target/release/cache-node --node-id node-2 --http-port 8081 --node-port 9091 \
+  --peers 127.0.0.1:8080,127.0.0.1:8082 --data-dir ./data/node2
 
-# Nœud 3
-./target/release/cache-node \
-  --node-id node-3 \
-  --http-port 8082 \
-  --node-port 9092 \
-  --peers "127.0.0.1:8080,127.0.0.1:8081" \
-  --data-dir ./data/node3 &
+./target/release/cache-node --node-id node-3 --http-port 8082 --node-port 9092 \
+  --peers 127.0.0.1:8080,127.0.0.1:8081 --data-dir ./data/node3
 ```
 
-## API REST publique
-
-### Écrire une entrée
+Chaque processus doit disposer de son propre répertoire de données.
+Pour Docker :
 
 ```bash
-# TTL optionnel en secondes (défaut: 3600)
-curl -X PUT "http://localhost:8080/v1/cache/my-key?ttl=300" \
-     -d "my-value"
+docker compose up --build -d
+docker compose ps
+docker compose down
 ```
 
-### Lire une entrée
+Les volumes conservent les données après `docker compose down`.
+
+## API
+
+Les requêtes publiques peuvent être adressées à n'importe quel nœud :
 
 ```bash
-# Depuis n'importe quel nœud — le router forward automatiquement
-curl http://localhost:8082/v1/cache/my-key
+# Écrire une valeur texte ; TTL en secondes, 3600 par défaut.
+curl -f -X PUT 'http://localhost:8080/v1/cache/my-key?ttl=300' -d 'my-value'
+
+# Lire via un autre nœud.
+curl -f http://localhost:8082/v1/cache/my-key
+
+# Supprimer ; renvoie {"key":"my-key","deleted":true} si présente.
+curl -f -X DELETE http://localhost:8081/v1/cache/my-key
+
+curl -f http://localhost:8080/v1/cluster/nodes
+curl -f http://localhost:8080/health
+curl -f http://localhost:8080/metrics
 ```
 
-Réponse :
+Une lecture réussie renvoie :
+
 ```json
 {
   "key": "my-key",
@@ -98,196 +74,105 @@ Réponse :
 }
 ```
 
-### Supprimer une entrée
+`served_by` identifie le nœud qui répond au client. Une clé absente ou expirée
+renvoie HTTP 404. `ttl=0` expire immédiatement. Les corps de PUT sont limités à
+16 Mio (HTTP 413 au-delà). Le stockage conserve les octets ; l'API GET publique
+les convertit en texte UTF-8 avec remplacement des séquences invalides.
+Une erreur de persistance renvoie HTTP 500 sans appliquer la mutation en mémoire.
+Les erreurs de transport vers un pair renvoient HTTP 502 ou 503.
+
+## Garanties et fonctionnement
+
+- **Routage** : ring SHA-256 avec 256 virtual nodes par adresse. Les noms
+  `--node-id` servent à l'observabilité et peuvent être personnalisés. Tous les
+  membres doivent configurer la même liste d'adresses, en incluant leur adresse
+  locale implicitement. Le gossip suit la santé des nœuds ; il ne reconfigure pas
+  le ring et ne déplace pas les données lors d'un changement de topologie.
+- **Stockage** : DashMap, expiration à la lecture et nettoyage toutes les
+  30 secondes. L'éviction LRU utilise un compteur logique d'accès. La capacité
+  est contrôlée par le nettoyage périodique, elle peut être dépassée entre deux
+  passages. Les compteurs d'entrées proviennent du contenu réel de la map.
+- **Réplication** : le facteur inclut le primaire (`2` = primaire + une copie).
+  Le propriétaire propage les écritures et suppressions en arrière-plan, y
+  compris lorsqu'il reçoit une requête transférée. Les copies conservent les
+  dates de création et d'expiration du primaire. Une réponse réussie garantit
+  l'écriture locale du destinataire, pas l'arrivée des copies sur les répliques.
+  La réplication est best effort : les opérations concurrentes peuvent arriver
+  dans un ordre différent, sans quorum, consensus ni réparation automatique.
+- **Circuit breaker** : ouverture après plusieurs échecs, puis essais de
+  récupération après le délai configuré. Le repli vers un autre nœud ne garantit
+  pas qu'il possède une copie à jour de la clé.
+- **Persistance** : les mutations sont journalisées et synchronisées sur disque
+  avant leur application en mémoire. Les nouveaux records conservent les dates
+  absolues : un redémarrage ne renouvelle pas le TTL. Un snapshot bloque les
+  mutations journalisées pendant sa capture et sa publication atomique. Son
+  checkpoint identifie la génération et la position du WAL ; la reprise reste
+  correcte si le processus s'arrête avant ou après le remplacement du journal.
+  Les E/S de persistance des requêtes s'exécutent dans le pool bloquant de Tokio.
+- **Récupération** : les records incomplets en fin de WAL sont tronqués avant
+  les nouvelles écritures. Un mauvais checksum, un en-tête invalide ou un snapshot
+  illisible provoque un échec explicite au démarrage. Après une erreur d'écriture
+  du WAL, les mutations suivantes sont rejetées jusqu'au redémarrage.
+
+Les anciens WAL v1 et snapshots restent lisibles. Les records SET v1 ne contiennent
+pas leur date de création : leur TTL relatif est donc réinitialisé à la migration.
+Le nouveau format et le nouveau protocole interne nécessitent une mise à jour de
+tous les nœuds ensemble ; les anciennes versions ne peuvent pas relire le WAL v2.
+Les anciens snapshots/archives ne sont pas supprimés automatiquement à la migration.
+Le ring utilise désormais les adresses à la place des anciens identifiants : lors
+d'une migration d'un ancien cluster, prévoir de réchauffer les clés auprès du
+backend d'origine, car leurs anciens propriétaires peuvent différer.
+
+Les routes `/internal/*` sont disponibles sur les deux ports pour que `--peers`
+puisse utiliser les adresses HTTP annoncées. Ce projet ne fournit ni authentification
+ni TLS : déployer le cluster sur un réseau privé avec des pairs de confiance.
+
+## Configuration
 
 ```bash
-curl -X DELETE http://localhost:8080/v1/cache/my-key
+./target/release/cache-node --help
+RUST_LOG=info ./target/release/cache-node --data-dir ./data/node1
 ```
 
-### Infos cluster
+| Option | Défaut | Rôle |
+| --- | --- | --- |
+| `--host` | `127.0.0.1` | Hôte annoncé, joignable par les pairs |
+| `--node-id` | `node-1` | Nom du nœud |
+| `--http-port` | `8080` | Port HTTP public et protocole interne |
+| `--node-port` | `9090` | Second listener du protocole interne |
+| `--peers` | vide | Adresses HTTP des autres nœuds, séparées par `,` |
+| `--data-dir` | `./data` | Répertoire WAL + snapshot |
+| `--max-entries` | `10000000` | Seuil de nettoyage LRU |
+| `--default-ttl-secs` | `3600` | TTL par défaut |
+| `--replication-factor` | `2` | Nombre total de copies souhaité |
+| `--virtual-nodes` | `256` | Virtual nodes par adresse |
+| `--gossip-interval-secs` | `30` | Intervalle du gossip |
+| `--heartbeat-interval-secs` | `5` | Intervalle des sondes de santé |
+| `--circuit-breaker-threshold` | `5` | Échecs avant ouverture |
+| `--circuit-breaker-timeout-secs` | `30` | Délai avant essai de récupération |
+| `--snapshot-interval-secs` | `60` | Intervalle des snapshots |
+| `--request-timeout-secs` | `10` | Timeout des échanges HTTP avec les pairs |
+
+Les intervalles, capacités et facteurs doivent être strictement positifs.
+Les ports public et interne doivent être différents.
+
+## Validation
 
 ```bash
-curl http://localhost:8080/v1/cluster/nodes
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+cargo build --locked
+python3 tests/cluster_smoke.py
 ```
 
-```json
-{
-  "node_id": "node-1",
-  "nodes": [
-    { "id": "node-1", "addr": "127.0.0.1:8080", "status": "Healthy", "last_seen": 1700000120 },
-    { "id": "node-2", "addr": "127.0.0.1:8081", "status": "Healthy", "last_seen": 1700000119 },
-    { "id": "node-3", "addr": "127.0.0.1:8082", "status": "Healthy", "last_seen": 1700000118 }
-  ],
-  "total_entries": 48293
-}
-```
+Les tests couvrent la concurrence sur le stockage, l'ordre LRU, les WAL tronqués
+ou corrompus, les erreurs disque, la compatibilité v1, les snapshots concurrents,
+les timeouts et l'accord des rings. Le test de cluster démarre trois processus,
+vérifie le routage, les grosses valeurs, le gossip, les copies et suppressions,
+les TTL, puis tue et redémarre le cluster pour vérifier la récupération.
 
-### Métriques Prometheus
-
-```bash
-curl http://localhost:8080/metrics
-```
-
-```
-# HELP cache_requests_total Total number of cache requests
-cache_requests_total{operation="get",result="hit"} 1042731
-cache_requests_total{operation="get",result="miss"} 3821
-cache_requests_total{operation="set",result="ok"} 198432
-
-# HELP cache_request_duration_seconds Cache request duration
-cache_request_duration_seconds_bucket{operation="get",le="0.0001"} 987234
-cache_request_duration_seconds_p99{operation="get"} 0.00043
-
-# HELP cache_entries_total Total entries in cache
-cache_entries_total 48293
-
-# HELP cluster_nodes_total Number of known cluster nodes
-cluster_nodes_total 3
-```
-
-### Health check
-
-```bash
-curl http://localhost:8080/health
-```
-
-## Options de configuration
-
-| Flag | Défaut | Description |
-|------|--------|-------------|
-| `--node-id` | `node-1` | Identifiant unique du nœud |
-| `--http-port` | `8080` | Port HTTP public |
-| `--node-port` | `9090` | Port interne inter-nœuds |
-| `--peers` | _(vide)_ | Adresses des autres nœuds (séparées par `,`) |
-| `--max-entries` | `10_000_000` | Capacité max avant éviction LRU |
-| `--default-ttl-secs` | `3600` | TTL par défaut (secondes) |
-| `--replication-factor` | `2` | Nombre de répliques par clé |
-| `--data-dir` | `./data` | Répertoire WAL + snapshots |
-| `--virtual-nodes` | `256` | Vnodes par nœud dans le ring |
-| `--gossip-interval-secs` | `30` | Fréquence du gossip |
-| `--heartbeat-interval-secs` | `5` | Fréquence des heartbeats |
-| `--circuit-breaker-threshold` | `5` | Échecs avant ouverture du circuit |
-| `--circuit-breaker-timeout-secs` | `30` | Délai avant demi-ouverture |
-| `--snapshot-interval-secs` | `60` | Fréquence des snapshots |
-| `--request-timeout-secs` | `10` | Timeout requêtes inter-nœuds |
-
-## Structure du projet
-
-```
-src/
-├── main.rs                   # Bootstrap, tokio::select! sur toutes les tâches
-├── config.rs                 # CLI via clap
-├── error.rs                  # CacheError unifié
-│
-├── storage/
-│   ├── engine.rs             # DashMap<String, Arc<Entry>> + évictions LRU/LFU
-│   └── eviction.rs           # Boucle de nettoyage asynchrone (toutes les 30s)
-│
-├── router/
-│   ├── consistent_hash.rs    # Ring BTreeMap avec vnodes SHA-256
-│   ├── circuit_breaker.rs    # State machine AtomicU8 (closed/open/half-open)
-│   └── mod.rs                # SmartRouter : routage + fallback + réplication
-│
-├── cluster/
-│   ├── mod.rs                # ClusterState : DashMap<NodeInfo> + merge gossip
-│   └── gossip.rs             # Push gossip + heartbeat asynchrones
-│
-├── network/
-│   ├── mod.rs                # AppState partagé (Arc<…> clonable)
-│   ├── node_client.rs        # Client HTTP interne sur hyper 0.14
-│   ├── node_server.rs        # Serveur interne axum (port node_port)
-│   └── http_server.rs        # API publique axum + forwarding + réplication async
-│
-├── persistence/
-│   ├── wal.rs                # WAL binaire [CRC32|len|bincode] + replay
-│   └── snapshot.rs           # Snapshots async + rotation + cleanup
-│
-└── metrics/
-    └── mod.rs                # Prometheus counters/histograms/gauges
-```
-
-## Fonctionnement interne
-
-### Consistent hashing
-
-Chaque nœud est représenté par `N` virtual nodes (défaut 256) dans un BTreeMap trié par hash SHA-256. Un `GET my-key` calcule `hash("my-key")` et cherche le successeur dans le ring en O(log n). Cela garantit qu'un client atteint toujours le bon nœud en **1 seul hop**.
-
-### Circuit breaker
-
-Trois états : `Closed` → `Open` → `Half-Open` → `Closed`. Après `threshold` échecs consécutifs le circuit s'ouvre et rejette immédiatement les requêtes vers le nœud défaillant. Après `timeout` secondes il passe en demi-ouverture et teste 3 requêtes successives avant de se refermer.
-
-### Réplication asynchrone
-
-Lors d'un `PUT`, le nœud primaire répond immédiatement au client puis envoie la valeur aux répliques via `tokio::spawn` en arrière-plan. Le `replication_factor` contrôle combien de nœuds reçoivent la copie.
-
-### WAL + Snapshots
-
-Chaque `SET` et `DELETE` est journalisé dans `cache.wal` avant d'être appliqué en mémoire. Le format est `[CRC32 4B][len 4B][bincode data]`. Un snapshot bincode complet est pris toutes les `snapshot-interval-secs` secondes, après quoi le WAL est roté. Au démarrage : chargement du dernier snapshot + replay du WAL résiduel.
-
-### Gossip protocol
-
-Toutes les `gossip-interval-secs` secondes, chaque nœud sélectionne aléatoirement la moitié de ses pairs et leur pousse l'état connu du cluster (vecteur de `NodeInfo`). Le récepteur fusionne en gardant l'information la plus récente (`last_seen` gagne). Les nœuds non vus depuis `3 × heartbeat_interval` sont marqués `Unhealthy`.
-
-## Déploiement Docker
-
-```dockerfile
-FROM rust:1.75 AS builder
-WORKDIR /app
-COPY . .
-RUN cargo build --release
-
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /app/target/release/cache-node /usr/local/bin/
-ENTRYPOINT ["cache-node"]
-```
-
-```yaml
-# docker-compose.yml
-version: "3.8"
-services:
-  node1:
-    build: .
-    command: >
-      --node-id node-1 --http-port 8080 --node-port 9090
-      --peers "node2:8081,node3:8082" --data-dir /data
-    ports: ["8080:8080"]
-    volumes: ["node1_data:/data"]
-
-  node2:
-    build: .
-    command: >
-      --node-id node-2 --http-port 8081 --node-port 9091
-      --peers "node1:8080,node3:8082" --data-dir /data
-    ports: ["8081:8081"]
-    volumes: ["node2_data:/data"]
-
-  node3:
-    build: .
-    command: >
-      --node-id node-3 --http-port 8082 --node-port 9092
-      --peers "node1:8080,node2:8081" --data-dir /data
-    ports: ["8082:8082"]
-    volumes: ["node3_data:/data"]
-
-volumes:
-  node1_data:
-  node2_data:
-  node3_data:
-```
-
-## Variables d'environnement
-
-```bash
-RUST_LOG=info,distributed_cache=debug  # Niveau de log
-```
-
-## Performance attendue
-
-| Opération | Latence p50 | Latence p99 |
-|-----------|-------------|-------------|
-| GET local | < 50 µs | < 200 µs |
-| GET forward | < 500 µs | < 2 ms |
-| SET + réplication | < 1 ms | < 5 ms |
-
-Gain typique vs appel backend direct : **−80% de latence** sur les chemins chauds.
+`bench.sh [URL]` mesure le débit HTTP dans votre environnement (outils : curl,
+bc, Python 3). Aucune latence ni réduction de latence n'est garantie sans mesure.
+Les synchronisations disque, le volume de données et la réplication influencent
+les performances.

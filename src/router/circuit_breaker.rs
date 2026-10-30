@@ -69,6 +69,7 @@ impl CircuitBreaker {
     }
 
     pub fn record_failure(&self) {
+        self.success_count.store(0, Ordering::Relaxed);
         let count = self.failure_count.fetch_add(1, Ordering::Relaxed) + 1;
         *self.last_failure_at.lock().unwrap() = Some(Instant::now());
 
